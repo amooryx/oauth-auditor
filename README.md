@@ -1,10 +1,10 @@
-﻿# oauth-auditor
+# oauth-auditor
 
 > Red team security tool for authorized testing only.
 
 ## Usage
 
-`ash
+```bash
 python oauth_auditor.py --help
 ```
 
