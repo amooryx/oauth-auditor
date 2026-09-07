@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="./banner.svg" alt="oauth-auditor" width="800">
+</div>
+
 # oauth-auditor
 
 > Red team security tool for authorized testing only.
