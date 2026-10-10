@@ -1,165 +1,304 @@
 #!/usr/bin/env python3
-"""
-OAuth Auditor — OAuth 2.0 / OIDC Security Testing Tool
-Tests for common OAuth misconfigurations: open redirects, token leakage, PKCE bypass.
-Author: Omar Khalid (amooryx) | github.com/amooryx/oauth-auditor
-AUTHORIZED USE ONLY — for authorized security testing and bug bounty.
-"""
+"""Offline OAuth/OIDC configuration checks and bounded OIDC discovery."""
 
 import argparse
+import ipaddress
 import json
+import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
-import urllib.error
 
-TESTS = {
-    "redirect_wildcard":    "Open redirect via wildcard or lax redirect_uri matching",
-    "state_missing":        "CSRF: authorization request lacks state parameter",
-    "token_in_fragment":    "Token leakage: implicit flow exposes token in URL fragment",
-    "pkce_bypass":          "PKCE bypass: authorization_code flow accepts request without code_challenge",
-    "scope_escalation":     "Scope escalation: server grants broader scopes than requested",
-    "client_secret_leak":   "Client secret exposed in public client or JS source",
-    "token_reuse":          "Authorization code reuse not rejected by server",
-}
+MAX_METADATA_BYTES = 1_048_576
+REQUEST_TIMEOUT_SECONDS = 5
+MAX_REDIRECTS = 3
+ENDPOINT_FIELDS = (
+    "authorization_endpoint",
+    "token_endpoint",
+    "userinfo_endpoint",
+    "jwks_uri",
+    "registration_endpoint",
+    "revocation_endpoint",
+    "introspection_endpoint",
+    "end_session_endpoint",
+)
+REQUIRED_METADATA_FIELDS = (
+    "issuer",
+    "authorization_endpoint",
+    "jwks_uri",
+    "response_types_supported",
+    "subject_types_supported",
+    "id_token_signing_alg_values_supported",
+)
 
-def check_auth_endpoint(auth_url: str, client_id: str, redirect_uri: str) -> dict:
-    """Probe the authorization endpoint for misconfigurations."""
-    results = {}
 
-    # 1. Build a minimal auth request
-    params = {
-        "response_type": "code",
-        "client_id":     client_id,
-        "redirect_uri":  redirect_uri,
-        "scope":         "openid profile email",
-        "state":         "audit_test_state",
-    }
-    full_url = f"{auth_url}?{urllib.parse.urlencode(params)}"
-    results["auth_url"] = full_url
-
-    # 2. Test redirect_uri manipulation
-    evil_redirects = [
-        redirect_uri.replace("https://", "https://evil.example.com@"),
-        redirect_uri.rstrip("/") + ".evil.example.com",
-        redirect_uri.rstrip("/") + "/../../../evil",
-        "https://evil.example.com",
-        "javascript:alert(1)",
-    ]
-    redirect_tests = []
-    for evil in evil_redirects:
-        p = dict(params)
-        p["redirect_uri"] = evil
-        test_url = f"{auth_url}?{urllib.parse.urlencode(p)}"
-        try:
-            req = urllib.request.Request(test_url)
-            req.add_header("User-Agent", "OAuthAuditor/1.0")
-            # We don't follow redirects — capture the raw 302 location
-            class NoRedirect(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, *args, **kwargs): return None
-            opener = urllib.request.build_opener(NoRedirect)
-            with opener.open(req, timeout=10) as resp:
-                location = resp.headers.get("Location", "")
-                redirect_tests.append({
-                    "evil_redirect": evil[:80],
-                    "result": "ACCEPTED" if evil in location else "REJECTED",
-                    "location": location[:100],
-                })
-        except urllib.error.HTTPError as e:
-            location = e.headers.get("Location", "") if e.headers else ""
-            accepted = urllib.parse.quote(evil, safe="") in urllib.parse.quote(location, safe="")
-            redirect_tests.append({
-                "evil_redirect": evil[:80],
-                "result": "ACCEPTED (via redirect)" if accepted else f"REJECTED ({e.code})",
-            })
-        except Exception as ex:
-            redirect_tests.append({"evil_redirect": evil[:80], "error": str(ex)})
-    results["redirect_uri_tests"] = redirect_tests
-
-    # 3. Test missing state (CSRF)
-    no_state_params = {k: v for k, v in params.items() if k != "state"}
-    no_state_url    = f"{auth_url}?{urllib.parse.urlencode(no_state_params)}"
-    results["missing_state_url"] = no_state_url
-    results["note_csrf"] = "If server accepts auth request without 'state', it may be CSRF-vulnerable"
-
-    # 4. Test implicit flow token exposure
-    implicit_params = dict(params)
-    implicit_params["response_type"] = "token"
-    results["implicit_flow_url"] = f"{auth_url}?{urllib.parse.urlencode(implicit_params)}"
-    results["note_implicit"] = "If server allows response_type=token, tokens may leak via Referer/history"
-
-    return results
-
-def fetch_oidc_discovery(issuer: str) -> dict:
-    url = issuer.rstrip("/") + "/.well-known/openid-configuration"
+def _is_loopback(hostname):
+    if not hostname:
+        return False
+    if hostname.lower() == "localhost":
+        return True
     try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            return json.loads(resp.read())
-    except Exception as e:
-        return {"error": str(e)}
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
-def audit_discovery(cfg: dict) -> list[dict]:
+
+def _validate_http_url(value, label, allow_loopback_http=True, allow_query=False):
+    if not isinstance(value, str) or not value:
+        raise ValueError("{} must be a non-empty URL".format(label))
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("{} must not contain control characters".format(label))
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("{} is not a valid URL: {}".format(label, exc))
+    if parsed.scheme != "https" and not (
+        allow_loopback_http and parsed.scheme == "http" and _is_loopback(hostname)
+    ):
+        raise ValueError("{} must use HTTPS (HTTP is allowed only for loopback)".format(label))
+    if not hostname or parsed.username is not None or parsed.password is not None:
+        raise ValueError("{} must have a host and must not contain credentials".format(label))
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            ascii_hostname = hostname.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError("{} has an invalid hostname".format(label))
+        labels = ascii_hostname.rstrip(".").split(".")
+        label_pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+        if (
+            not ascii_hostname
+            or len(ascii_hostname.rstrip(".")) > 253
+            or any(not label_pattern.fullmatch(part) for part in labels)
+        ):
+            raise ValueError("{} has an invalid hostname".format(label))
+    if (("?" in value) and not allow_query) or "#" in value:
+        raise ValueError("{} has a disallowed query or fragment".format(label))
+    return parsed
+
+
+def _validate_redirect_uri(value):
+    if not isinstance(value, str) or not value:
+        raise ValueError("redirect URI must be a non-empty absolute URI")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.scheme in ("https", "http"):
+            _validate_http_url(value, "redirect URI", allow_query=True)
+        elif parsed.scheme and parsed.scheme not in (
+            "javascript", "data", "file", "ftp", "mailto", "blob", "vbscript"
+        ):
+            if not parsed.path and not parsed.netloc:
+                raise ValueError("redirect URI must identify an absolute URI")
+            if parsed.username is not None or parsed.password is not None:
+                raise ValueError("redirect URI must not contain credentials")
+        else:
+            raise ValueError("redirect URI must use HTTPS, loopback HTTP, or a native-app scheme")
+    except ValueError as exc:
+        raise ValueError("invalid redirect URI: {}".format(exc))
+    if parsed.fragment or "#" in value:
+        raise ValueError("redirect URI must not contain a fragment")
+    return parsed
+
+
+def _validate_metadata(cfg):
+    if not isinstance(cfg, dict):
+        raise ValueError("OIDC metadata must be a JSON object")
+    missing = [field for field in REQUIRED_METADATA_FIELDS if field not in cfg]
+    if missing:
+        raise ValueError("OIDC metadata is missing required field(s): {}".format(", ".join(missing)))
+    if not isinstance(cfg["issuer"], str) or not cfg["issuer"]:
+        raise ValueError("metadata issuer must be a non-empty string")
+    _validate_http_url(cfg["issuer"], "metadata issuer", allow_loopback_http=True)
+    for field in ENDPOINT_FIELDS:
+        if field in cfg:
+            _validate_http_url(
+                cfg[field], "metadata {}".format(field),
+                allow_loopback_http=True, allow_query=True
+            )
+    for field in (
+        "response_types_supported",
+        "subject_types_supported",
+        "id_token_signing_alg_values_supported",
+    ):
+        value = cfg[field]
+        if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+            raise ValueError("metadata {} must be an array of non-empty strings".format(field))
+    for field in ("grant_types_supported", "code_challenge_methods_supported",
+                  "token_endpoint_auth_methods_supported"):
+        if field in cfg and (
+            not isinstance(cfg[field], list)
+            or not all(isinstance(item, str) and item for item in cfg[field])
+        ):
+            raise ValueError("metadata {} must be an array of non-empty strings".format(field))
+    return cfg
+
+
+def audit_discovery(cfg, expected_issuer=None):
+    """Return evidence-backed risks and unverified assumptions for OIDC metadata."""
+    _validate_metadata(cfg)
     findings = []
-    if cfg.get("response_types_supported") and "token" in cfg["response_types_supported"]:
-        findings.append({"severity": "Medium", "issue": "Implicit flow (response_type=token) is supported",
-                         "detail": "Tokens may leak via browser history, Referer header"})
-    if cfg.get("grant_types_supported") and "password" in cfg.get("grant_types_supported", []):
-        findings.append({"severity": "Medium", "issue": "Resource Owner Password Credentials grant supported",
-                         "detail": "ROPC bypasses MFA; should be disabled"})
-    if not cfg.get("code_challenge_methods_supported"):
-        findings.append({"severity": "Medium", "issue": "PKCE not advertised in discovery document",
-                         "detail": "Public clients may be vulnerable to code interception"})
+    assumptions = []
+
+    if expected_issuer is not None:
+        _validate_http_url(expected_issuer, "expected issuer")
+        if cfg["issuer"] != expected_issuer:
+            findings.append({
+                "severity": "High",
+                "issue": "Discovery issuer does not match the requested issuer",
+                "evidence": {"expected": expected_issuer, "metadata": cfg["issuer"]},
+            })
+
+    implicit_response_types = [
+        value for value in cfg["response_types_supported"]
+        if "token" in value.split() or "id_token" in value.split()
+    ]
+    if implicit_response_types:
+        findings.append({
+            "severity": "Medium",
+            "issue": "Discovery metadata advertises an implicit response type",
+            "evidence": {"response_types_supported": implicit_response_types},
+            "detail": "This documents advertised capability; it does not prove a client uses it.",
+        })
+
+    if "password" in cfg.get("grant_types_supported", []):
+        findings.append({
+            "severity": "Medium",
+            "issue": "Discovery metadata advertises the Resource Owner Password Credentials grant",
+            "evidence": {"grant_type": "password"},
+            "detail": "This documents advertised capability; it does not prove the grant is enabled for a client.",
+        })
+
+    if "code" in cfg["response_types_supported"] and not cfg.get("code_challenge_methods_supported"):
+        assumptions.append({
+            "issue": "PKCE support is not advertised in discovery metadata",
+            "detail": "Absence of this optional metadata does not establish that the authorization server rejects PKCE.",
+        })
     if cfg.get("token_endpoint_auth_methods_supported") == ["none"]:
-        findings.append({"severity": "High", "issue": "Token endpoint accepts unauthenticated clients",
-                         "detail": "No client authentication enforced"})
-    return findings
+        assumptions.append({
+            "issue": "Only the public-client token endpoint auth method is advertised",
+            "detail": "The none method is valid for public clients and is not, by itself, a security vulnerability.",
+        })
+
+    return {"findings": findings, "assumptions": assumptions}
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, origin):
+        super().__init__()
+        self.origin = origin
+        self.redirect_count = 0
+
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        self.redirect_count += 1
+        if self.redirect_count > MAX_REDIRECTS:
+            raise urllib.error.HTTPError(new_url, code, "too many redirects", headers, response)
+        target = urllib.parse.urlsplit(new_url)
+        if (target.scheme, target.netloc) != self.origin:
+            raise urllib.error.HTTPError(new_url, code, "cross-origin redirect refused", headers, response)
+        return super().redirect_request(request, response, code, message, headers, new_url)
+
+
+def fetch_oidc_discovery(issuer):
+    parsed = _validate_http_url(issuer, "issuer")
+    discovery_url = issuer.rstrip("/") + "/.well-known/openid-configuration"
+    origin = (parsed.scheme, parsed.netloc)
+    opener = urllib.request.build_opener(_SameOriginRedirectHandler(origin))
+    request = urllib.request.Request(
+        discovery_url,
+        headers={"Accept": "application/json", "User-Agent": "OAuthAuditor/2.0"},
+    )
+    with opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        body = response.read(MAX_METADATA_BYTES + 1)
+    if len(body) > MAX_METADATA_BYTES:
+        raise ValueError("discovery response exceeds the {} byte limit".format(MAX_METADATA_BYTES))
+    try:
+        cfg = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("discovery response is not valid UTF-8 JSON: {}".format(exc))
+    return _validate_metadata(cfg)
+
+
+def check_auth_endpoint(auth_url, redirect_uri):
+    """Validate URL syntax only; registration and server behavior cannot be tested offline."""
+    _validate_http_url(auth_url, "authorization endpoint", allow_query=True)
+    _validate_redirect_uri(redirect_uri)
+    return {
+        "authorization_endpoint": auth_url,
+        "redirect_uri": redirect_uri,
+        "findings": [],
+        "assumptions": [{
+            "issue": "Redirect URI registration and matching behavior were not verified",
+            "detail": "This offline check validates URI syntax only; it sends no authorization request.",
+        }],
+    }
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="OAuth Auditor — OAuth 2.0 Security Testing (Authorized use only)",
+        description="Offline OAuth/OIDC configuration checks and bounded OIDC discovery."
     )
     subparsers = parser.add_subparsers(dest="cmd")
 
-    disc_p = subparsers.add_parser("discover", help="Audit OIDC discovery document")
-    disc_p.add_argument("issuer",   help="OIDC issuer URL (e.g., https://accounts.google.com)")
-    disc_p.add_argument("--out",    help="Output JSON file")
+    disc_p = subparsers.add_parser("discover", help="Fetch and audit a bounded OIDC discovery document")
+    disc_p.add_argument("issuer", help="HTTPS issuer URL (loopback HTTP is allowed for local testing)")
+    disc_p.add_argument("--out", help="Output JSON file")
 
-    probe_p = subparsers.add_parser("probe", help="Probe authorization endpoint")
-    probe_p.add_argument("auth_url",     help="Authorization endpoint URL")
-    probe_p.add_argument("--client-id",  required=True)
-    probe_p.add_argument("--redirect",   required=True, help="Registered redirect_uri")
-    probe_p.add_argument("--out",        help="Output JSON file")
+    audit_p = subparsers.add_parser("audit", help="Audit a local OIDC discovery JSON file")
+    audit_p.add_argument("metadata", help="Path to a local OIDC discovery JSON file")
+    audit_p.add_argument("--issuer", help="Expected issuer identifier")
+    audit_p.add_argument("--out", help="Output JSON file")
+
+    probe_p = subparsers.add_parser(
+        "probe", help="Offline URL validation only; no authorization requests are sent"
+    )
+    probe_p.add_argument("auth_url", help="Authorization endpoint URL")
+    probe_p.add_argument("--redirect", required=True, help="Client redirect URI")
+    probe_p.add_argument("--out", help="Output JSON file")
 
     args = parser.parse_args()
     if not args.cmd:
         parser.print_help()
-        sys.exit(1)
+        return 2
 
-    if args.cmd == "discover":
-        print(f"[*] Fetching OIDC discovery: {args.issuer}")
-        cfg      = fetch_oidc_discovery(args.issuer)
-        findings = audit_discovery(cfg)
-        print(f"[+] Discovery fetched. Findings: {len(findings)}")
-        for f in findings:
-            print(f"  [{f['severity']}] {f['issue']}")
-            print(f"         {f['detail']}")
-        result = {"issuer": args.issuer, "discovery": cfg, "findings": findings}
-        if args.out:
-            with open(args.out, "w") as f:
-                json.dump(result, f, indent=2)
-            print(f"[*] → {args.out}")
+    try:
+        if args.cmd == "discover":
+            cfg = fetch_oidc_discovery(args.issuer)
+            result = {
+                "issuer": args.issuer,
+                "discovery": cfg,
+                **audit_discovery(cfg, expected_issuer=args.issuer),
+            }
+        elif args.cmd == "audit":
+            with open(args.metadata, "rb") as metadata_file:
+                body = metadata_file.read(MAX_METADATA_BYTES + 1)
+            if len(body) > MAX_METADATA_BYTES:
+                raise ValueError("metadata file exceeds the {} byte limit".format(MAX_METADATA_BYTES))
+            try:
+                cfg = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("metadata file is not valid UTF-8 JSON: {}".format(exc))
+            result = {
+                "issuer": args.issuer or (cfg.get("issuer", "") if isinstance(cfg, dict) else ""),
+                "discovery": cfg,
+                **audit_discovery(cfg, expected_issuer=args.issuer),
+            }
+        else:
+            result = check_auth_endpoint(args.auth_url, args.redirect)
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        print("Error: {}".format(exc), file=sys.stderr)
+        return 2
 
-    elif args.cmd == "probe":
-        print(f"[*] Probing authorization endpoint: {args.auth_url}")
-        result = check_auth_endpoint(args.auth_url, args.client_id, args.redirect)
-        print("[+] Redirect URI tests:")
-        for t in result.get("redirect_uri_tests", []):
-            flag = "  [!!!]" if "ACCEPTED" in t.get("result", "") else "  [OK] "
-            print(f"{flag} {t.get('evil_redirect','')[:60]:60s}  → {t.get('result','')}")
-        if args.out:
-            with open(args.out, "w") as f:
-                json.dump(result, f, indent=2)
-            print(f"[*] → {args.out}")
+    output = json.dumps(result, indent=2)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as output_file:
+            output_file.write(output + "\n")
+    print(output)
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
